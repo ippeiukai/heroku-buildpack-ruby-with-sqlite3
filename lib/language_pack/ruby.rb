@@ -14,9 +14,8 @@ class LanguagePack::Ruby < LanguagePack::Base
   NAME                 = "ruby"
   LIBYAML_VERSION      = "0.1.6"
   LIBYAML_PATH         = "libyaml-#{LIBYAML_VERSION}"
-  BUNDLER_VERSION      = "1.9.7"
+  BUNDLER_VERSION      = "1.11.2"
   BUNDLER_GEM_PATH     = "bundler-#{BUNDLER_VERSION}"
-  DEFAULT_RUBY_VERSION = "ruby-2.0.0"
   RBX_BASE_URL         = "http://binaries.rubini.us/heroku"
   NODE_BP_PATH         = "vendor/node/bin"
 
@@ -76,6 +75,15 @@ class LanguagePack::Ruby < LanguagePack::Base
     end
   end
 
+  def best_practice_warnings
+    if bundler.has_gem?("asset_sync")
+      warn(<<-WARNING)
+You are using the `asset_sync` gem.
+See https://devcenter.heroku.com/articles/please-do-not-use-asset-sync for more information.
+WARNING
+    end
+  end
+
   def compile
     instrument 'ruby.compile' do
       # check for new app at the beginning of the compile
@@ -95,6 +103,7 @@ class LanguagePack::Ruby < LanguagePack::Base
         install_binaries
         run_assets_precompile_rake_task
       end
+      best_practice_warnings
       super
     end
   end
@@ -197,10 +206,21 @@ case $(ulimit -u) in
 512)   # 2X Dyno
   JVM_MAX_HEAP=768
   ;;
+16384) # IX Dyno
+  JVM_MAX_HEAP=2048
+  ;;
 32768) # PX Dyno
   JVM_MAX_HEAP=5120
   ;;
 esac
+EOF
+  end
+
+  def set_java_mem
+    <<-EOF
+if ! [[ "${JAVA_OPTS}" == *-Xmx* ]]; then
+  export JAVA_MEM=${JAVA_MEM:--Xmx${JVM_MAX_HEAP:-384}m}
+fi
 EOF
   end
 
@@ -214,6 +234,10 @@ case $(ulimit -u) in
 512)
   export HEROKU_RAM_LIMIT_MB=${HEROKU_RAM_LIMIT_MB:-1024}
   export WEB_CONCURRENCY=${WEB_CONCURRENCY:-4}
+  ;;
+16384)
+  export HEROKU_RAM_LIMIT_MB=${HEROKU_RAM_LIMIT_MB:-2560}
+  export WEB_CONCURRENCY=${WEB_CONCURRENCY:-8}
   ;;
 32768)
   export HEROKU_RAM_LIMIT_MB=${HEROKU_RAM_LIMIT_MB:-6144}
@@ -231,10 +255,10 @@ EOF
     "-Xcompile.invokedynamic=false"
   end
 
-  # default JAVA_TOOL_OPTIONS
-  # return [String] string of JAVA_TOOL_OPTIONS
-  def default_java_tool_options
-    "-Xmx${JVM_MAX_HEAP:-\"384\"}m -Djava.rmi.server.useCodebaseOnly=true"
+  # default Java Xmx
+  # return [String] string of Java Xmx
+  def default_java_mem
+    "-Xmx${JVM_MAX_HEAP:-384}m"
   end
 
   # sets up the environment variables for the build process
@@ -242,14 +266,14 @@ EOF
     instrument 'ruby.setup_language_pack_environment' do
       if ruby_version.jruby?
         ENV["PATH"] += ":bin"
-        ENV["JAVA_TOOL_OPTIONS"] = run(<<-SHELL).chomp
+        ENV["JAVA_MEM"] = run(<<-SHELL).chomp
 #{set_jvm_max_heap}
-echo #{default_java_tool_options}
+echo #{default_java_mem}
 SHELL
         ENV["JRUBY_OPTS"] = env('JRUBY_BUILD_OPTS') || env('JRUBY_OPTS')
       end
       setup_ruby_install_env
-      ENV["PATH"] += ":#{node_bp_bin_path}" if node_js_installed?
+      ENV["PATH"] += ":#{node_preinstall_bin_path}" if node_js_installed?
 
       # TODO when buildpack-env-args rolls out, we can get rid of
       # ||= and the manual setting below
@@ -274,9 +298,9 @@ SHELL
 
       if ruby_version.jruby?
         add_to_export set_jvm_max_heap
+        add_to_export set_java_mem
         set_export_default "JAVA_OPTS",  default_java_opts
         set_export_default "JRUBY_OPTS", default_jruby_opts
-        set_export_default "JAVA_TOOL_OPTIONS", default_java_tool_options
       end
     end
   end
@@ -292,9 +316,9 @@ SHELL
 
       if ruby_version.jruby?
         add_to_profiled set_jvm_max_heap
+        add_to_profiled set_java_mem
         set_env_default "JAVA_OPTS", default_java_opts
         set_env_default "JRUBY_OPTS", default_jruby_opts
-        set_env_default "JAVA_TOOL_OPTIONS", default_java_tool_options
       end
     end
   end
@@ -357,7 +381,7 @@ ERROR_MSG
 
       topic "Using Ruby version: #{ruby_version.version}"
       if !ruby_version.set
-        warn(<<WARNING)
+        warn(<<-WARNING)
 You have not declared a Ruby version in your Gemfile.
 To set your Ruby version add this line to your Gemfile:
 #{ruby_version.to_gemfile}
@@ -368,12 +392,21 @@ WARNING
 
     true
   rescue LanguagePack::Fetcher::FetchError => error
-    message = <<ERROR
+    if ruby_version.jruby?
+      message = <<ERROR
+An error occurred while installing Ruby #{ruby_version.version}
+For supported Ruby versions see https://devcenter.heroku.com/articles/ruby-support#supported-runtimes
+Note: Only JRuby 1.7.13 and newer are supported on Cedar-14
+#{error.message}
+ERROR
+    else
+      message = <<ERROR
 An error occurred while installing Ruby #{ruby_version.version}
 For supported Ruby versions see https://devcenter.heroku.com/articles/ruby-support#supported-runtimes
 Note: Only the most recent version of Ruby 2.1 is supported on Cedar-14
 #{error.message}
 ERROR
+    end
     error message
   end
 
@@ -469,7 +502,7 @@ ERROR
       if false # load_default_cache?
         puts "New app detected loading default bundler cache"
         patchlevel = run("ruby -e 'puts RUBY_PATCHLEVEL'").chomp
-        cache_name  = "#{DEFAULT_RUBY_VERSION}-p#{patchlevel}-default-cache"
+        cache_name  = "#{LanguagePack::RubyVersion::DEFAULT_VERSION}-p#{patchlevel}-default-cache"
         @fetchers[:buildpack].fetch_untar("#{cache_name}.tgz")
       end
     end
@@ -492,7 +525,7 @@ ERROR
   # https://github.com/heroku/heroku-buildpack-ruby/issues/21
   def remove_vendor_bundle
     if File.exists?("vendor/bundle")
-      warn(<<WARNING)
+      warn(<<-WARNING)
 Removing `vendor/bundle`.
 Checking in `vendor/bundle` is not supported. Please remove this directory
 and add it to your .gitignore. To vendor your gems with Bundler, use
@@ -515,8 +548,19 @@ WARNING
         bundle_command = "#{bundle_bin} install --without #{bundle_without} --path vendor/bundle --binstubs #{bundler_binstubs_path}"
         bundle_command << " -j4"
 
+        if File.exist?("#{Dir.pwd}/.bundle/config")
+          warn(<<-WARNING, inline: true)
+You have the `.bundle/config` file checked into your repository
+ It contains local state like the location of the installed bundle
+ as well as configured git local gems, and other settings that should
+not be shared between multiple checkouts of a single repo. Please
+remove the `.bundle/` folder from your repo and add it to your `.gitignore` file.
+https://devcenter.heroku.com/articles/bundler-configuration
+WARNING
+        end
+
         if bundler.windows_gemfile_lock?
-          warn(<<WARNING, inline: true)
+          warn(<<-WARNING, inline: true)
 Removing `Gemfile.lock` because it was generated on Windows.
 Bundler will do a full resolve so native gems are handled properly.
 This may result in unexpected gem versions being used in your app.
@@ -529,10 +573,9 @@ WARNING
         else
           # using --deployment is preferred if we can
           bundle_command += " --deployment"
-          cache.load ".bundle"
         end
 
-        topic("Installing dependencies using #{bundler.version}")
+        topic("Installing dependencies using bundler #{bundler.version}")
         load_bundler_cache
 
         bundler_output = ""
@@ -632,8 +675,10 @@ ERROR
   # writes ERB based database.yml for Rails. The database.yml uses the DATABASE_URL from the environment during runtime.
   def create_database_yml
     instrument 'ruby.create_database_yml' do
+      return false unless File.directory?("config")
+      return false if  bundler.has_gem?('activerecord') && bundler.gem_version('activerecord') >= Gem::Version.new('4.1.0.beta1')
+
       log("create_database_yml") do
-        return unless File.directory?("config")
         topic("Writing config/database.yml to read from DATABASE_URL")
         File.open("config/database.yml", "w") do |file|
           file.puts <<-DATABASE_YML
@@ -690,7 +735,7 @@ params = CGI.parse(uri.query || "")
 <% params.each do |key, value| %>
   <%= key %>: <%= value.first %>
 <% end %>
-        DATABASE_YML
+          DATABASE_YML
         end
       end
     end
@@ -698,9 +743,12 @@ params = CGI.parse(uri.query || "")
 
   def rake
     @rake ||= begin
-      LanguagePack::Helpers::RakeRunner.new(
-                bundler.has_gem?("rake") || ruby_version.rake_is_vendored?
-              ).load_rake_tasks!(env: rake_env)
+      rake_gem_available = bundler.has_gem?("rake") || ruby_version.rake_is_vendored?
+      raise_on_fail      = bundler.gem_version('railties') && bundler.gem_version('railties') > Gem::Version.new('3.x')
+
+      rake = LanguagePack::Helpers::RakeRunner.new(rake_gem_available)
+      rake.load_rake_tasks!({ env: rake_env }, raise_on_fail)
+      rake
     end
   end
 
@@ -727,24 +775,35 @@ params = CGI.parse(uri.query || "")
   # decides if we need to enable the dev database addon
   # @return [Array] the database addon if the pg gem is detected or an empty Array if it isn't.
   def add_dev_database_addon
-    bundler.has_gem?("pg") ? ['heroku-postgresql:hobby-dev'] : []
+    bundler.has_gem?("pg") ? ['heroku-postgresql'] : []
   end
 
   # decides if we need to install the node.js binary
   # @note execjs will blow up if no JS RUNTIME is detected and is loaded.
   # @return [Array] the node.js binary path if we need it or an empty Array
   def add_node_js_binary
-    bundler.has_gem?('execjs') && !node_js_installed? ? [@node_installer.binary_path] : []
-  end
-
-  def node_bp_bin_path
-    "#{Dir.pwd}/#{NODE_BP_PATH}"
+    bundler.has_gem?('execjs') && node_not_preinstalled? ? [@node_installer.binary_path] : []
   end
 
   # checks if node.js is installed via the official heroku-buildpack-nodejs using multibuildpack
-  # @return [Boolean] true if it's detected and false if it isn't
-  def node_js_installed?
-    @node_js_installed ||= run("#{node_bp_bin_path}/node -v") && $?.success?
+  # @return String if it's detected and false if it isn't
+  def node_preinstall_bin_path
+    return @node_preinstall_bin_path if defined?(@node_preinstall_bin_path)
+
+    legacy_path = "#{Dir.pwd}/#{NODE_BP_PATH}"
+    path        = run("which node")
+    if path && $?.success?
+      @node_preinstall_bin_path = path
+    elsif run("#{legacy_path}/node -v") && $?.success?
+      @node_preinstall_bin_path = legacy_path
+    else
+      @node_preinstall_bin_path = false
+    end
+  end
+  alias :node_js_installed? :node_preinstall_bin_path
+
+  def node_not_preinstalled?
+    !node_js_installed?
   end
 
   def run_assets_precompile_rake_task
@@ -791,9 +850,21 @@ params = CGI.parse(uri.query || "")
       rubygems_version_cache  = "rubygems_version"
       stack_cache             = "stack"
 
+      old_bundler_version  = @metadata.read(bundler_version_cache).chomp if @metadata.exists?(bundler_version_cache)
       old_rubygems_version = @metadata.read(ruby_version_cache).chomp if @metadata.exists?(ruby_version_cache)
       old_stack = @metadata.read(stack_cache).chomp if @metadata.exists?(stack_cache)
       old_stack ||= DEFAULT_LEGACY_STACK
+
+      if old_bundler_version && old_bundler_version != BUNDLER_VERSION
+        puts(<<-WARNING)
+Your app was upgraded to bundler #{ BUNDLER_VERSION }.
+Previously you had a successful deploy with bundler #{ old_bundler_version }.
+
+If you see problems related to the bundler version please refer to:
+https://devcenter.heroku.com/articles/bundler-version
+
+WARNING
+      end
 
       stack_change  = old_stack != @stack
       convert_stack = @bundler_cache.old?

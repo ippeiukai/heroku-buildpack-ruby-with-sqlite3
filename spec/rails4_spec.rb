@@ -12,7 +12,6 @@ describe "Rails 4.0.x" do
 
   it "should deploy on ruby 2.0.0" do
     Hatchet::Runner.new("rails4-manifest").deploy do |app, heroku|
-      add_database(app, heroku)
       expect(app.output).to include("Detected manifest file, assuming assets were compiled locally")
       expect(app.output).not_to match("Include 'rails_12factor' gem to enable all platform features")
     end
@@ -28,7 +27,6 @@ describe "Rails 4.0.x" do
   it "upgraded from 3 to 4 missing ./bin still works" do
     Hatchet::Runner.new("rails3-to-4-no-bin").deploy do |app, heroku|
       expect(app.output).to include("Asset precompilation completed")
-      add_database(app, heroku)
 
       expect(app.output).to match("WARNING")
       expect(app.output).to match("Include 'rails_12factor' gem to enable all platform features")
@@ -40,6 +38,7 @@ describe "Rails 4.0.x" do
   end
 
   it "works with windows" do
+    pending("failing due to free dynos not being able to have more than 1 process type")
     Hatchet::Runner.new("rails4_windows_mri193").deploy do |app, heroku|
       result = app.run("rails -v")
       expect(result).to match("4.0.0")
